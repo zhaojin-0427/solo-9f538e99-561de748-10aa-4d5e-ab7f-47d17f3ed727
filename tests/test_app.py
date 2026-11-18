@@ -247,3 +247,170 @@ def test_persistence_across_restart(app, client, tmp_path):
     page = client2.get("/days/2026-11-16").get_data(as_text=True)
     assert "行程（1）" in page and "异常（5）" in page
     assert q1(app2, "SELECT COUNT(*) n FROM events")["n"] == 9
+
+
+# ---------- 交付页与作业签收 ----------
+
+def latest_pub(app, day):
+    return q1(app, "SELECT * FROM publications WHERE day=? ORDER BY pub_id DESC", (day,))
+
+
+def receipt(client, job_id, pub_id):
+    return client.post("/delivery/receipts",
+                       data={"job_id": job_id, "pub_id": str(pub_id)},
+                       follow_redirects=True)
+
+
+def test_receipt_accept_and_idempotent_retry(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub = latest_pub(app, "2026-11-16")
+
+    page = receipt(client, "etl-job-01", pub["pub_id"]).get_data(as_text=True)
+    assert "签收成功" in page
+    r = q1(app, "SELECT * FROM receipts WHERE day='2026-11-16' AND job_id='etl-job-01'")
+    assert r["verdict"] == "accepted" and r["pub_id"] == pub["pub_id"]
+
+    # 重试同一发布号 → 返回首次结论，不新增记录
+    page = receipt(client, "etl-job-01", pub["pub_id"]).get_data(as_text=True)
+    assert "首次结论：已签收" in page
+    assert q1(app, "SELECT COUNT(*) n FROM receipts")["n"] == 1
+
+    # 交付页展示最新发布与签收记录
+    page = client.get("/delivery").get_data(as_text=True)
+    assert "可供签收" in page and "etl-job-01" in page and "已签收" in page
+
+
+def test_receipt_conflicting_pub_id_rejected(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub1 = latest_pub(app, "2026-11-16")
+    receipt(client, "etl-job-01", pub1["pub_id"])
+
+    publish(client, "2026-11-16")  # 重发得到新发布号
+    pub2 = latest_pub(app, "2026-11-16")
+    assert pub2["pub_id"] != pub1["pub_id"]
+
+    # 同一作业改报其他发布号 → 冲突，首次结论保持不变
+    page = receipt(client, "etl-job-01", pub2["pub_id"]).get_data(as_text=True)
+    assert "冲突" in page
+    r = q1(app, "SELECT * FROM receipts WHERE day='2026-11-16' AND job_id='etl-job-01'")
+    assert r["pub_id"] == pub1["pub_id"] and r["verdict"] == "accepted"
+    assert q1(app, "SELECT COUNT(*) n FROM receipts")["n"] == 1
+
+    # 其他作业不受冲突影响，可正常签收新发布
+    page = receipt(client, "etl-job-02", pub2["pub_id"]).get_data(as_text=True)
+    assert "签收成功" in page
+
+
+def test_receipt_requires_latest_unexpired_publication(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub1 = latest_pub(app, "2026-11-16")
+
+    # 补传使发布过期 → 该日暂停供数，签收被拒
+    upload(client, HEADER + "C002,E4,2,2026-11-16T09:00:00Z,Delta,out\n")
+    page = receipt(client, "etl-job-01", pub1["pub_id"]).get_data(as_text=True)
+    assert "签收被拒" in page and "已过期" in page
+    r = q1(app, "SELECT * FROM receipts WHERE job_id='etl-job-01'")
+    assert r["verdict"] == "rejected"
+    assert "暂停供数" in client.get("/delivery").get_data(as_text=True)
+
+    # 重发后恢复可供签收；签收旧发布号 → 不是最新，被拒
+    publish(client, "2026-11-16")
+    pub2 = latest_pub(app, "2026-11-16")
+    assert "可供签收" in client.get("/delivery").get_data(as_text=True)
+    page = receipt(client, "etl-job-02", pub1["pub_id"]).get_data(as_text=True)
+    assert "签收被拒" in page and "不是该日最新发布" in page
+
+    # 新作业签收最新发布 → 成功
+    page = receipt(client, "etl-job-03", pub2["pub_id"]).get_data(as_text=True)
+    assert "签收成功" in page
+
+
+def test_staled_receipt_and_snapshot_remain_visible(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub1 = latest_pub(app, "2026-11-16")
+    receipt(client, "etl-job-01", pub1["pub_id"])
+
+    # 补传使已签收版本过期：旧签收与快照保持可查，该日暂停供数
+    upload(client, HEADER + "C002,E4,2,2026-11-16T09:00:00Z,Delta,out\n")
+    page = client.get("/delivery").get_data(as_text=True)
+    assert "etl-job-01" in page and "已签收" in page  # 旧签收保持可查
+    assert "暂停供数" in page
+    old_snap = client.get(f"/publications/{pub1['pub_id']}").get_data(as_text=True)
+    assert "已过期" in old_snap and "Gamma" in old_snap  # 旧快照保持可读
+
+    # 重发后新版本恢复待签收
+    publish(client, "2026-11-16")
+    pub2 = latest_pub(app, "2026-11-16")
+    page = client.get("/delivery").get_data(as_text=True)
+    assert "可供签收" in page
+    page = receipt(client, "etl-job-02", pub2["pub_id"]).get_data(as_text=True)
+    assert "签收成功" in page
+    # 两条签收记录都在交付页可查
+    page = client.get("/delivery").get_data(as_text=True)
+    assert "etl-job-01" in page and "etl-job-02" in page
+
+
+def test_receipt_based_on_committed_day_version(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub = latest_pub(app, "2026-11-16")
+    receipt(client, "etl-job-01", pub["pub_id"])
+    r = q1(app, "SELECT * FROM receipts WHERE job_id='etl-job-01'")
+    dv = q1(app, "SELECT version FROM day_versions WHERE day='2026-11-16'")
+    # 签收结论基于同一已提交日版本/事件集版本
+    assert r["day_version"] == dv["version"] == pub["day_version"]
+    assert r["event_set_version"] == get_esv(connect(app.config["DB_PATH"]))
+
+
+def test_receipt_invalid_requests_leave_no_partial_record(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub = latest_pub(app, "2026-11-16")
+
+    # 发布号不存在 / 非数字 / 作业 ID 为空 → 报错且不落库
+    assert "不存在" in receipt(client, "etl-job-01", 9999).get_data(as_text=True)
+    page = client.post("/delivery/receipts", data={"job_id": "etl-job-01", "pub_id": "abc"},
+                       follow_redirects=True).get_data(as_text=True)
+    assert "正整数" in page
+    page = client.post("/delivery/receipts", data={"job_id": "  ", "pub_id": str(pub["pub_id"])},
+                       follow_redirects=True).get_data(as_text=True)
+    assert "不能为空" in page
+    assert q1(app, "SELECT COUNT(*) n FROM receipts")["n"] == 0
+
+    # 失败尝试不影响后续正常签收
+    assert "签收成功" in receipt(client, "etl-job-01", pub["pub_id"]).get_data(as_text=True)
+    assert q1(app, "SELECT COUNT(*) n FROM receipts")["n"] == 1
+
+
+def test_receipt_unique_first_verdict_per_job_day(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-16")
+    pub = latest_pub(app, "2026-11-16")
+    receipt(client, "etl-job-01", pub["pub_id"])
+    # 数据库层唯一约束：同一作业对同一日不可能出现第二条签收（半份签收不可见）
+    import sqlite3
+    conn = connect(app.config["DB_PATH"])
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO receipts(day, job_id, pub_id, verdict, day_version,"
+                " event_set_version, created_at) VALUES('2026-11-16','etl-job-01',?,?,?,?,?)",
+                (pub["pub_id"], "accepted", 0, 0, "2026-11-18T00:00:00Z"))
+    finally:
+        conn.close()
+    assert q1(app, "SELECT COUNT(*) n FROM receipts")["n"] == 1
+
+
+def test_delivery_page_render(app, client):
+    upload(client, BASE)
+    publish(client, "2026-11-15")
+    publish(client, "2026-11-16")
+    pub = latest_pub(app, "2026-11-16")
+    receipt(client, "etl-job-01", pub["pub_id"])
+    page = client.get("/delivery").get_data(as_text=True)
+    assert "2026-11-15" in page and "2026-11-16" in page
+    assert "提交签收" in page

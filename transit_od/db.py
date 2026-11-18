@@ -6,6 +6,8 @@
 - meta.event_set_version：每提交一个"有实际变更"的批次 +1，标识已提交事件集版本。
 - day_versions：每个 UTC 日的数据版本，批次提交时按受影响日期 +1，
   用于判断某日发布是否已过期。
+- receipts：分析作业的签收记录（首次结论唯一），签收判定与写入同样在
+  单个 BEGIN IMMEDIATE 事务内完成。
 """
 import os
 import sqlite3
@@ -94,6 +96,21 @@ CREATE TABLE IF NOT EXISTS publication_anomalies (
   reason    TEXT NOT NULL            -- dangling_entry | orphan_exit
 );
 CREATE INDEX IF NOT EXISTS idx_panom_pub ON publication_anomalies(pub_id);
+
+-- 分析作业签收记录：同一作业对同一 UTC 日只有一条首次结论（UNIQUE 约束保证），
+-- 判定与写入在单个事务内完成，失败整体回滚，不留半份签收
+CREATE TABLE IF NOT EXISTS receipts (
+  receipt_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  day               TEXT NOT NULL,
+  job_id            TEXT NOT NULL,
+  pub_id            INTEGER NOT NULL, -- 作业报告的发布号
+  verdict           TEXT NOT NULL CHECK (verdict IN ('accepted','rejected')),
+  reason            TEXT,             -- 拒绝原因；签收成功为 NULL
+  day_version       INTEGER NOT NULL, -- 签收判定时该日的已提交数据版本
+  event_set_version INTEGER NOT NULL, -- 签收判定时的已提交事件集版本
+  created_at        TEXT NOT NULL,
+  UNIQUE(day, job_id)
+);
 """
 
 

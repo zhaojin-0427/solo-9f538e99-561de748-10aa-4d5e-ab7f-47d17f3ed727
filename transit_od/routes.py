@@ -1,4 +1,4 @@
-"""页面路由：上传、按 UTC 日发布/查看、批次与事件浏览。"""
+"""页面路由：上传、按 UTC 日发布/查看、批次与事件浏览、交付页签收。"""
 import json
 import re
 
@@ -8,6 +8,7 @@ from flask import (Blueprint, abort, current_app, flash, g, redirect,
 from .db import connect, get_day_version, now_iso
 from .ingest import commit_batch, record_failed_batch
 from .publish import publish_day
+from .receipts import ReceiptError, pub_is_current, submit_receipt
 
 bp = Blueprint("main", __name__)
 
@@ -157,3 +158,64 @@ def publication(pub_id):
     trips, anomalies = _pub_rows(conn, pub_id)
     return render_template("publication.html", pub=pub, state=_pub_state(pub, dv),
                            trips=trips, anomalies=anomalies, reasons=REASONS)
+
+
+@bp.route("/delivery")
+def delivery():
+    """交付页：按 UTC 日展示最新发布、供数状态与各作业签收记录。"""
+    conn = get_db()
+    latest = {}
+    for r in conn.execute(
+        "SELECT p.* FROM publications p"
+        " JOIN (SELECT day, MAX(pub_id) AS m FROM publications GROUP BY day) t ON t.m = p.pub_id"
+    ):
+        latest[r["day"]] = r
+    dvs = {r["day"]: r["version"] for r in conn.execute("SELECT day, version FROM day_versions")}
+    receipts = {}
+    for r in conn.execute("SELECT * FROM receipts ORDER BY receipt_id"):
+        receipts.setdefault(r["day"], []).append(r)
+    rows = []
+    for d in sorted(set(latest) | set(receipts), reverse=True):
+        pub = latest.get(d)
+        if pub is None:
+            state = "未发布"
+        elif pub_is_current(pub, dvs.get(d, 0)):
+            state = "可供签收"
+        else:
+            state = "暂停供数"
+        rows.append({"day": d, "pub": pub, "state": state, "receipts": receipts.get(d, [])})
+    return render_template("delivery.html", rows=rows)
+
+
+@bp.route("/delivery/receipts", methods=["POST"])
+def delivery_receipt():
+    """作业提交签收：作业 ID + 发布号（日期由发布号所属发布推导）。"""
+    job_id = request.form.get("job_id", "")
+    raw_pub = (request.form.get("pub_id") or "").strip()
+    if not re.fullmatch(r"[0-9]+", raw_pub):
+        flash("签收失败：发布号必须为正整数", "err")
+        return redirect(url_for("main.delivery"))
+    pub_id = int(raw_pub)
+    try:
+        result = submit_receipt(get_db(), job_id, pub_id)
+    except ReceiptError as e:
+        flash(f"签收失败：{e}", "err")
+        return redirect(url_for("main.delivery"))
+
+    day, receipt, outcome = result["day"], result["receipt"], result["outcome"]
+    if outcome == "accepted":
+        flash(f"签收成功：作业 {receipt['job_id']} 已签收 {day} 发布 #{pub_id}", "ok")
+    elif outcome == "rejected":
+        flash(f"签收被拒：{receipt['reason']}（该结论已记录为作业 {receipt['job_id']} 对 {day} 的首次结论）", "err")
+    elif outcome == "retry":
+        if receipt["verdict"] == "accepted":
+            flash(f"作业 {receipt['job_id']} 对 {day} 发布 #{pub_id} 的首次结论：已签收"
+                  f"（{receipt['created_at']}，重复提交不改动结论）", "ok")
+        else:
+            flash(f"作业 {receipt['job_id']} 对 {day} 发布 #{pub_id} 的首次结论：已拒绝"
+                  f"（{receipt['reason']}；重复提交不改动结论）", "err")
+    else:  # conflict
+        flash(f"冲突：作业 {receipt['job_id']} 对 {day} 已报告发布 #{receipt['pub_id']}"
+              f"（结论：{'已签收' if receipt['verdict'] == 'accepted' else '已拒绝'}），"
+              f"本次改报发布 #{pub_id} 被拒绝", "err")
+    return redirect(url_for("main.delivery"))

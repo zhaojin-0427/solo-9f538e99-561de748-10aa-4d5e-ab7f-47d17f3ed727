@@ -1,0 +1,49 @@
+{% extends 'base.html' %}
+{% block title %}交付页{% endblock %}
+{% block content %}
+<div class="card">
+<h2>交付页 — 按 UTC 日的发布签收</h2>
+<p class="muted">分析作业在此提交作业 ID 与发布号完成签收（日期由发布号所属发布推导）。
+仅该日<b>最新且未过期</b>的发布可签收；同一作业对同一日的首次结论唯一，
+重试同一发布号返回首次结论，改报其他发布号将报冲突。
+补传使已签收版本过期后，旧签收与快照保持可查，该日暂停供数；重发后新版本恢复待签收。</p>
+<form method="post" action="{{ url_for('main.delivery_receipt') }}">
+  <label>作业 ID <input name="job_id" required maxlength="120" placeholder="如 etl-job-01"></label>
+  <label>发布号 <input name="pub_id" required inputmode="numeric" pattern="[0-9]+" placeholder="如 3"></label>
+  <button type="submit">提交签收</button>
+</form>
+</div>
+{% for r in rows %}
+<div class="card">
+<h3>UTC 日 {{ r.day }}</h3>
+{% if r.pub %}
+<p>最新发布：<a href="{{ url_for('main.publication', pub_id=r.pub['pub_id']) }}">#{{ r.pub['pub_id'] }}</a>
+（{{ r.pub['created_at'] }}，行程 {{ r.pub['trip_count'] }}，异常 {{ r.pub['anomaly_count'] }}）
+｜ 供数状态：
+  {% if r.state == '可供签收' %}<span class="badge b-ok">可供签收</span>
+  {% else %}<span class="badge b-stale">暂停供数（最新发布已过期，待重发）</span>{% endif %}
+</p>
+{% else %}
+<p><span class="badge b-none">未发布</span></p>
+{% endif %}
+<table>
+<tr><th>作业 ID</th><th>报告发布号</th><th>结论</th><th>说明</th><th>签收时间(UTC)</th><th>判定时日版本</th><th>事件集版本</th></tr>
+{% for s in r.receipts %}
+<tr>
+  <td>{{ s['job_id'] }}</td>
+  <td><a href="{{ url_for('main.publication', pub_id=s['pub_id']) }}">#{{ s['pub_id'] }}</a></td>
+  <td>{% if s['verdict'] == 'accepted' %}<span class="badge b-ok">已签收</span>{% else %}<span class="badge b-stale">已拒绝</span>{% endif %}</td>
+  <td>{{ s['reason'] or '—' }}</td>
+  <td>{{ s['created_at'] }}</td>
+  <td>v{{ s['day_version'] }}</td>
+  <td>v{{ s['event_set_version'] }}</td>
+</tr>
+{% else %}
+<tr><td colspan="7" class="muted">暂无作业签收</td></tr>
+{% endfor %}
+</table>
+</div>
+{% else %}
+<div class="card"><p class="muted">暂无发布与签收记录，请先上传 CSV 并发布。</p></div>
+{% endfor %}
+{% endblock %}
